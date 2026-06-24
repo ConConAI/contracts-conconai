@@ -107,12 +107,14 @@ The owner can **never** mutate `purchased[]`, reverse a claim, or unset the one-
 src/            ConToken.sol            canonical token (also used for Sepolia + Etherscan verify)
                 Presale.sol             phased presale (book-then-claim), binds to existing $CON
                 interfaces/IAggregatorV3.sol   minimal Chainlink ETH/USD feed interface
+                mocks/                  TESTNET ONLY: MockUSDC, MockUSDT, MockAggregatorV3
 test/           ConToken.t.sol          token tests (supply, ERC20, no-mint, permit, fuzz)
                 Presale.t.sol           presale unit + fuzz tests
                 mocks/                  MockERC20 (6/18 dec), MockAggregator (Chainlink stub)
                 invariant/              handler + invariant tests (accounting invariants)
 script/         DeployConToken.s.sol    token deploy (reference/testnet)
                 DeployPresale.s.sol     presale deploy, reads config from addresses.json
+                DeploySepoliaTestEnv.s.sol   TESTNET ONLY: one-shot Sepolia env + funding
 deployments/    addresses.json          committed canonical addresses, keyed by network
 lib/            forge-std, openzeppelin-contracts (v5.1.0)
 ```
@@ -247,6 +249,94 @@ Finally, record the deployed presale address under the network's `presale` entry
 > **Lifecycle:** `startPhase` (per phase) → buyers `buyWithStable` / `buyWithETH` →
 > `endPresale` (one-way) → `enableClaim` (one-way) → buyers `claim()`. `pause()` halts buying in an
 > emergency without ever blocking claims.
+
+---
+
+## One-shot Sepolia test environment (TESTNET ONLY)
+
+> ⚠️ **TESTNET ONLY.** `script/DeploySepoliaTestEnv.s.sol` and everything under
+> [`src/mocks/`](src/mocks) (`MockUSDC`, `MockUSDT`, `MockAggregatorV3`) are for Sepolia testing only
+> and **must never be deployed to mainnet**. The mocks are freely mintable and the oracle price is
+> settable by anyone; the script also **reverts if run on mainnet** (chain id `1`). The real mainnet
+> `$CON` is never touched — the script deploys a fresh **test copy** of the token.
+
+Instead of wiring Sepolia by hand, this script deploys and connects the whole environment in a single
+broadcast:
+
+1. a fresh test `ConToken` (mints 100,000,000 test CON to the treasury),
+2. `MockUSDC` + `MockUSDT` (6-decimal, freely mintable),
+3. `MockAggregatorV3` (8-decimal ETH/USD, seeded at `$3000`),
+4. a `Presale` bound to all of the above (owner/treasury = `sepolia.admin`), and
+5. a transfer of **50,000,000 test CON** from the treasury into the presale so claims can pay out.
+
+The treasury/admin is read from `deployments/addresses.json` (`sepolia.admin`). **Signing comes from
+your own wallet at runtime — there are no hardcoded keys.** Because the test CON is minted to the
+treasury and then moved into the presale in the same broadcast, **you must run this with the
+`sepolia.admin` wallet**.
+
+### 1. Prerequisites
+
+- Set `sepolia.admin` in `deployments/addresses.json` to the address you will deploy from.
+- In `.env`, set `RPC_URL` (a Sepolia RPC) and `ETHERSCAN_API_KEY` (for `--verify`).
+
+### 2. Deploy the environment
+
+```bash
+source .env
+
+# Encrypted keystore (import once via: cast wallet import sepolia-admin --interactive)
+forge script script/DeploySepoliaTestEnv.s.sol:DeploySepoliaTestEnv \
+  --rpc-url "$RPC_URL" \
+  --account sepolia-admin \
+  --broadcast \
+  --verify
+
+# ...or a hardware wallet:
+forge script script/DeploySepoliaTestEnv.s.sol:DeploySepoliaTestEnv \
+  --rpc-url "$RPC_URL" \
+  --ledger \
+  --broadcast \
+  --verify
+```
+
+The run prints every deployed address plus ready-to-paste snippets for the `sepolia` entry of
+`deployments/addresses.json` and for the website `.env.local`
+(`NEXT_PUBLIC_*_SEPOLIA` + the presale address). Paste both in, set `NEXT_PUBLIC_ICO_LIVE=true` and
+`NEXT_PUBLIC_ICO_CHAIN=sepolia` on the website, and the buy panel goes live against Sepolia.
+
+### 3. Mint yourself test stablecoins
+
+`MockUSDC` / `MockUSDT` use 6 decimals, so `1000 USDC = 1000000000`:
+
+```bash
+# 1,000 mUSDC to your address
+cast send <MOCK_USDC> "mint(address,uint256)" <YOUR_ADDR> 1000000000 \
+  --rpc-url "$RPC_URL" --account sepolia-admin
+
+# 1,000 mUSDT
+cast send <MOCK_USDT> "mint(address,uint256)" <YOUR_ADDR> 1000000000 \
+  --rpc-url "$RPC_URL" --account sepolia-admin
+```
+
+### 4. Set / refresh the oracle price
+
+The mock ETH/USD feed is seeded at `$3000` (`3000e8`). To change it (8 decimals), or to refresh the
+timestamp so the presale's staleness guard passes:
+
+```bash
+# Set ETH/USD to $3,500 (also refreshes updatedAt to a fresh round)
+cast send <MOCK_FEED> "setAnswer(int256)" 350000000000 \
+  --rpc-url "$RPC_URL" --account sepolia-admin
+
+# Or just refresh the timestamp (e.g. after time has passed beyond MAX_ORACLE_AGE)
+cast send <MOCK_FEED> "setUpdatedAt(uint256)" $(date +%s) \
+  --rpc-url "$RPC_URL" --account sepolia-admin
+```
+
+> **Funding note:** the script already moves 50,000,000 test CON into the presale, so `claim()` is
+> fully covered once you run `enableClaim()`. You can then drive the lifecycle with `cast`
+> (`startPhase`, buy with mock stables / ETH, `endPresale`, `enableClaim`, `claim`) or the admin
+> console.
 
 ---
 
