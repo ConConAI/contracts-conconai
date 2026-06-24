@@ -1,0 +1,17 @@
+{
+  "name": "contracts-conconai",
+  "version": "1.0.0",
+  "description": "Foundry contracts for the ConCon ($CON) ecosystem.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "forge build",
+    "test": "forge test",
+    "fmt": "forge fmt",
+    "fmt:check": "forge fmt --check",
+    "lint": "solhint 'src/**/*.sol' 'script/**/*.sol' 'test/**/*.sol'"
+  },
+  "devDependencies": {
+    "solhint": "^5.0.5"
+  }
+}

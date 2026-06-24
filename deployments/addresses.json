@@ -1,0 +1,15 @@
+{
+  "_comment": "Canonical on-chain addresses for the ConCon ($CON) project. Public addresses, not secrets. Locked 2026-06-24. Single source of truth for downstream contracts, scripts and frontend.",
+  "mainnet": {
+    "chainId": 1,
+    "token": "0x7ad1A8Fc42Ac150B04dED5825D21a0C90b6d28D8",
+    "admin": "0x46bca9FCf2f372e76D9aE265Da725B222F5ac2e0",
+    "_note": "$CON is live on Ethereum mainnet at the token address above. The deploy script targets testnet; on mainnet it is reference/verification only."
+  },
+  "sepolia": {
+    "chainId": 11155111,
+    "token": "",
+    "admin": "0x46bca9FCf2f372e76D9aE265Da725B222F5ac2e0",
+    "_note": "Token left blank until a test copy of ConToken is deployed to Sepolia; fill in after deploy."
+  }
+}

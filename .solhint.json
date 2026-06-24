@@ -1,0 +1,16 @@
+{
+  "extends": "solhint:recommended",
+  "rules": {
+    "compiler-version": ["error", "^0.8.24"],
+    "func-visibility": ["error", { "ignoreConstructors": true }],
+    "max-line-length": ["error", 120],
+    "not-rely-on-time": "off",
+    "no-empty-blocks": "off",
+    "gas-custom-errors": "off",
+    "import-path-check": "off",
+    "no-console": "off",
+    "func-name-mixedcase": "off",
+    "use-natspec": "off",
+    "no-global-import": "off"
+  }
+}

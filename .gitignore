@@ -1,0 +1,25 @@
+# Foundry build artifacts
+out/
+cache/
+
+# Broadcast logs (deploy artifacts; may contain network-specific data)
+broadcast/
+!broadcast/**/dry-run/
+
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Coverage
+lcov.info
+coverage/
+
+# Docs build
+docs/book/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
