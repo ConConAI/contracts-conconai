@@ -2,9 +2,14 @@
 
 Smart contracts for the **ConCon (`$CON`)** ecosystem, built with [Foundry](https://book.getfoundry.sh/).
 
-This repository currently contains the canonical, fixed-supply `$CON` ERC-20 token. Follow-up
-contracts (Presale, Claim, LiquidityLocker, ListingDeposit) will bind to the token address recorded
-in [`deployments/addresses.json`](deployments/addresses.json).
+This repository contains:
+
+- the canonical, fixed-supply **`$CON`** ERC-20 token, and
+- the phased **`Presale`** contract (booking + claim model) that binds to the already-deployed
+  `$CON` token.
+
+Follow-up contracts (LiquidityLocker, ListingDeposit) will likewise bind to the token address
+recorded in [`deployments/addresses.json`](deployments/addresses.json).
 
 > ⚠️ **A professional security audit is mandatory before any mainnet use.** The code in this repo
 > is delivered as-is and does not replace an audit. Claude/Cursor never holds keys and never signs
@@ -57,14 +62,59 @@ on Sepolia.
 
 ---
 
+## The Presale
+
+[`src/Presale.sol`](src/Presale.sol) sells `$CON` across **5 phases** of **10,000,000 CON each**
+(50M total) at fixed prices **$0.005 → $0.009**. It uses a **book-then-claim** model: a purchase
+**books** the buyer's allocation (no `$CON` is transferred at purchase); after the presale the admin
+opens claiming and buyers withdraw their allocation.
+
+### Payment & pricing
+
+- Prices are stored per token in USD at **1e6 scale** (`$0.005 == 5000`).
+- **USDC / USDT** (6 decimals) count **1:1 USD**: `conAmount = stableAmount * 1e18 / priceUsdE6`.
+- **ETH** is priced via the **Chainlink ETH/USD feed**. Each read requires `answer > 0`, a fresh
+  `updatedAt` (heartbeat guard, `MAX_ORACLE_AGE = 1 hour`), and `answeredInRound >= roundId`, else it
+  reverts. No price is ever invented.
+- **Cap clamping:** a purchase that would exceed a phase cap books only the remaining amount and
+  charges only the exact cost; for ETH the excess is refunded after state updates (CEI).
+
+### Immutable config (no setters)
+
+Set once in the constructor (reverts on any zero address): `conToken`, `usdc`, `usdt`, `ethUsdFeed`,
+`treasury` (= admin/owner). The deploy script reads these from `deployments/addresses.json`.
+
+### Admin powers (owner = treasury, `Ownable2Step`)
+
+`startPhase(i, duration)` (sequential only), `setTimer` / `extendTimer`, `endPhase`,
+`endPresale` (one-way), `enableClaim` (one-way, independent), `pause` / `unpause` (blocks buys only —
+**claims stay enabled**), `withdraw(asset)` (raised USDC/USDT/ETH to treasury; **reverts for
+`$CON`**), `sweepUnsold` (only the EXCESS `$CON`, always leaving outstanding claims fully covered).
+
+The owner can **never** mutate `purchased[]`, reverse a claim, or unset the one-way flags.
+
+### Buyer-protection / trust invariants
+
+- `sum(purchased) + totalClaimed == totalSold`
+- `conToken.balanceOf(presale) >= totalSold - totalClaimed` (outstanding claims always covered)
+- `phase.sold <= cap` for every phase
+
+---
+
 ## Project layout
 
 ```
-src/         ConToken.sol            canonical token (also used for Sepolia + Etherscan verify)
-test/        ConToken.t.sol          Foundry tests (supply, ERC20, no-mint, permit, fuzz)
-script/      DeployConToken.s.sol    deploy script (user signs with own wallet)
-deployments/ addresses.json          committed canonical addresses, keyed by network
-lib/         forge-std, openzeppelin-contracts (v5.1.0)
+src/            ConToken.sol            canonical token (also used for Sepolia + Etherscan verify)
+                Presale.sol             phased presale (book-then-claim), binds to existing $CON
+                interfaces/IAggregatorV3.sol   minimal Chainlink ETH/USD feed interface
+test/           ConToken.t.sol          token tests (supply, ERC20, no-mint, permit, fuzz)
+                Presale.t.sol           presale unit + fuzz tests
+                mocks/                  MockERC20 (6/18 dec), MockAggregator (Chainlink stub)
+                invariant/              handler + invariant tests (accounting invariants)
+script/         DeployConToken.s.sol    token deploy (reference/testnet)
+                DeployPresale.s.sol     presale deploy, reads config from addresses.json
+deployments/    addresses.json          committed canonical addresses, keyed by network
+lib/            forge-std, openzeppelin-contracts (v5.1.0)
 ```
 
 - Solidity `^0.8.24`, optimizer **on** (`200` runs), see [`foundry.toml`](foundry.toml).
@@ -112,13 +162,26 @@ forge fmt --check        # verify formatting (CI gate)
 npm run lint             # solhint
 ```
 
-The test suite covers:
+**Token** (`ConToken.t.sol`):
 
 - `totalSupply == 100,000,000e18`, `decimals == 18`, full supply minted to treasury, name/symbol.
 - `transfer` / `transferFrom` / `approve` happy paths and revert paths.
 - No callable mint path (supply is capped by design).
 - `ERC20Permit`: a valid signature sets the allowance; reverts on expired deadline / bad signature.
 - Fuzzed transfers: amount `<=` balance succeeds, `>` balance reverts.
+
+**Presale** (`Presale.t.sol` + `invariant/`, using mock USDC/USDT and a mock Chainlink aggregator):
+
+- Buying with USDC / USDT / ETH books the correct CON amount at each phase price; multi-phase pricing.
+- Cap clamping charges the exact required amount and books exactly the remaining; ETH excess refunded.
+- Oracle guards: stale / zero / negative price revert ETH buys.
+- Buys revert when the phase is not started, after `endsAt`, once `presaleEnded`, or while paused.
+- Claim reverts before `enableClaim`, succeeds after, double-claim reverts, zero-allocation reverts,
+  and claiming still works while paused.
+- `withdraw` moves stablecoins/ETH to the treasury and reverts for `$CON`; `sweepUnsold` always keeps
+  outstanding claims covered.
+- One-way flags cannot be unset; non-owner reverts on every admin function; `Ownable2Step` flow.
+- Fuzz + invariant tests (random buys/claims) assert the accounting invariants above.
 
 ---
 
@@ -152,13 +215,52 @@ forge script script/DeployConToken.s.sol:DeployConToken \
 After a Sepolia deploy, record the deployed token address under the `sepolia` entry in
 `deployments/addresses.json`.
 
+### Deploying the Presale
+
+`script/DeployPresale.s.sol` reads the immutable config (`token`, `admin`, `usdc`, `usdt`,
+`ethUsdFeed`) from `deployments/addresses.json` for the chosen network and binds the presale to the
+**existing** `$CON` token (it does **not** deploy a token). The network is taken from the `NETWORK`
+env var, or inferred from the chain id (`1` → `mainnet`, `11155111` → `sepolia`).
+
+For Sepolia testing, first deploy a test `$CON` copy and deploy mock 6-decimal stablecoins plus a
+mock Chainlink ETH/USD aggregator, then fill their addresses into the `sepolia` entry of
+`addresses.json`.
+
+```bash
+source .env
+
+NETWORK=sepolia forge script script/DeployPresale.s.sol:DeployPresale \
+  --rpc-url "$RPC_URL" \
+  --ledger \
+  --broadcast \
+  --verify
+```
+
+**Funding the presale (required for claims).** After deploy, the **treasury transfers up to
+50,000,000 `$CON` into the presale contract** so that `claim()` can pay out — this is a user action
+performed with the treasury's own wallet (e.g. via a Safe). The contract enforces that outstanding
+claims always remain covered, and `sweepUnsold` can only ever move the surplus back to the treasury.
+
+Finally, record the deployed presale address under the network's `presale` entry in
+`addresses.json`.
+
+> **Lifecycle:** `startPhase` (per phase) → buyers `buyWithStable` / `buyWithETH` →
+> `endPresale` (one-way) → `enableClaim` (one-way) → buyers `claim()`. `pause()` halts buying in an
+> emergency without ever blocking claims.
+
 ---
 
 ## Security & trust model
 
-- Fixed supply, **no mint backdoor**, **no pause/blacklist** on the token.
-- No owner/admin power over balances.
-- Revenue (in later contracts) flows to a multisig treasury.
+- **Token:** fixed supply, **no mint backdoor**, **no pause/blacklist**, no owner power over balances.
+- **Presale:** immutable config (no setters), custom errors, events on every state change, strict CEI,
+  `ReentrancyGuard`, `Pausable`, `Ownable2Step`, `SafeERC20`, pull-pattern claim, one-way lifecycle
+  flags, and no unbounded loops / `delegatecall` / `tx.origin`.
+- Buyers' booked `$CON` can never be withdrawn or swept by the admin; raised funds (USDC/USDT/ETH)
+  flow to the treasury (recommended: a Safe multisig).
+- The Chainlink ETH/USD read is guarded against zero/negative/stale answers and incomplete rounds.
+  Verify the live feed's heartbeat against `MAX_ORACLE_AGE` and re-verify all mainnet token/oracle
+  addresses against official sources before mainnet.
 - **An independent professional audit is required before mainnet.** This code does not replace one.
 
 This is not financial or legal advice. ICO/securities considerations must be handled separately.
