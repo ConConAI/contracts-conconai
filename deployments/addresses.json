@@ -13,12 +13,12 @@
   },
   "sepolia": {
     "chainId": 11155111,
-    "token": "",
-    "admin": "0x46bca9FCf2f372e76D9aE265Da725B222F5ac2e0",
-    "presale": "",
-    "usdc": "",
-    "usdt": "",
-    "ethUsdFeed": "",
-    "_note": "Fill token/usdc/usdt/ethUsdFeed with addresses from the Sepolia test deploys (test ConToken copy, mock 6-decimal stables, mock Chainlink ETH/USD aggregator). Add presale after deploying Presale."
+    "token": "0x2b46b7ADE321F2aaBfF0C9301e22210Ad9Ab0B43",
+    "admin": "0x6EA38ea652ED642608796c81802FDb19c6342A1f",
+    "presale": "0x671fa7Cf9998b22D5d6585E4C629D74FE6E1eAa8",
+    "usdc": "0x2EdBDa9e5E03964302D3c0b63afEDB90C01Be98a",
+    "usdt": "0x90C6Ebd8F477f7703890987d176BF3333D0D9D64",
+    "ethUsdFeed": "0xE776F3bcb64eeb772E9291cfa08Eb6628b3D63d2",
+    "_note": "TESTNET ONLY: test ConToken copy + freely-mintable mock stables + mock Chainlink ETH/USD aggregator, deployed via DeploySepoliaTestEnv. Presale funded with 50,000,000 test CON. admin is a disposable Sepolia test wallet."
   }
 }

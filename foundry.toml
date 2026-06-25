@@ -15,6 +15,8 @@ remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
     "forge-std/=lib/forge-std/src/",
 ]
+# Read-only access so deploy scripts can read the committed deployments/addresses.json.
+fs_permissions = [{access = "read", path = "./deployments"}]
 
 [profile.default.fuzz]
 runs = 256
