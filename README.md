@@ -76,8 +76,27 @@ opens claiming and buyers withdraw their allocation.
 - **ETH** is priced via the **Chainlink ETH/USD feed**. Each read requires `answer > 0`, a fresh
   `updatedAt` (heartbeat guard, `MAX_ORACLE_AGE = 1 hour`), and `answeredInRound >= roundId`, else it
   reverts. No price is ever invented.
-- **Cap clamping:** a purchase that would exceed a phase cap books only the remaining amount and
-  charges only the exact cost; for ETH the excess is refunded after state updates (CEI).
+- **Cap clamping:** a purchase that would exceed a phase cap (or the global `PRESALE_CAP` of
+  **50,000,000 CON**) books only the remaining amount and charges only the exact cost; for ETH the
+  excess is refunded after state updates (CEI).
+
+### Stacking purchase bonus
+
+Buyers earn one-time, **stacking** bonus `$CON` as their **cumulative** USD contribution
+(stables 1:1, ETH via the oracle — only the amount actually charged counts) crosses fixed thresholds:
+
+| Cumulative spend | Bonus for crossing | Total bonus so far |
+| ---------------- | ------------------ | ------------------ |
+| ≥ $10,000        | +50,000 CON        | 50,000 CON         |
+| ≥ $25,000        | +150,000 CON       | 200,000 CON        |
+| ≥ $50,000        | +400,000 CON       | 600,000 CON        |
+
+Each tier is granted at most once per buyer (`bonusTiersAwarded[buyer]` is monotonic 0→3). The bonus
+is a **pure booking** (no external call): it is added to `purchased[buyer]` and `totalSold` only —
+**never** to a phase cap — and is itself clamped to the remaining global cap so `totalSold` can never
+exceed `PRESALE_CAP`. The deployer funds the presale with the full 50M so base **and** bonuses are
+claimable. Read it without spending via `previewPurchase(buyer, usdE6)` →
+`(baseCon, bonusCon, newTier)`; thresholds/amounts are exposed by `bonusTiers()`.
 
 ### Immutable config (no setters)
 
@@ -95,9 +114,10 @@ The owner can **never** mutate `purchased[]`, reverse a claim, or unset the one-
 
 ### Buyer-protection / trust invariants
 
-- `sum(purchased) + totalClaimed == totalSold`
+- `sum(purchased) + totalClaimed == totalSold` (base + stacking bonuses)
 - `conToken.balanceOf(presale) >= totalSold - totalClaimed` (outstanding claims always covered)
-- `phase.sold <= cap` for every phase
+- `phase.sold <= cap` for every phase (phase caps count base only)
+- `totalSold <= PRESALE_CAP` (base + bonuses never exceed the 50M global cap)
 
 ---
 
@@ -183,7 +203,12 @@ npm run lint             # solhint
 - `withdraw` moves stablecoins/ETH to the treasury and reverts for `$CON`; `sweepUnsold` always keeps
   outstanding claims covered.
 - One-way flags cannot be unset; non-owner reverts on every admin function; `Ownable2Step` flow.
-- Fuzz + invariant tests (random buys/claims) assert the accounting invariants above.
+- **Stacking bonus:** single buys at $10k / $25k / $50k award 50k / 200k / 600k bonus CON and are
+  claimable; stepwise crossing grants each tier exactly once and stacks; ETH buys drive tiers via the
+  mock oracle; base + bonuses never exceed the 50M global cap (clamp near sellout) while per-phase base
+  stays ≤ 10M; `previewPurchase` matches the actual booked base + bonus.
+- Fuzz + invariant tests (random buys/claims) assert the accounting invariants above, including
+  `totalSold <= PRESALE_CAP`.
 
 ---
 

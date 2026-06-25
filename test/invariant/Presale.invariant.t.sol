@@ -11,9 +11,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 /// @title Presale invariant tests
 /// @notice Verifies core accounting invariants hold under randomized sequences of buys and claims.
 /// @dev Invariants:
-///      - sum(purchased) + totalClaimed == totalSold
+///      - sum(purchased) + totalClaimed == totalSold   [base + stacking bonuses]
 ///      - CON balance >= (totalSold - totalClaimed)   [contract always covers outstanding claims]
 ///      - phase.sold <= cap for every phase
+///      - totalSold <= PRESALE_CAP   [base + bonuses never exceed the global cap]
 contract PresaleInvariantTest is Test {
     Presale internal presale;
     PresaleHandler internal handler;
@@ -62,5 +63,9 @@ contract PresaleInvariantTest is Test {
             (, uint256 cap, uint256 sold,,) = presale.phases(i);
             assertLe(sold, cap);
         }
+    }
+
+    function invariant_TotalSoldWithinPresaleCap() public view {
+        assertLe(presale.totalSold(), presale.PRESALE_CAP());
     }
 }

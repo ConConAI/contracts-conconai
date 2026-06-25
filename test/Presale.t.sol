@@ -185,16 +185,19 @@ contract PresaleTest is Test {
         presale.buyWithStable(IERC20(address(usdc)), amount);
         vm.stopPrank();
 
-        // Booked exactly the remaining cap (10M CON).
-        assertEq(presale.purchased(alice), CAP);
+        // Base booked exactly the remaining phase cap (10M CON); the phase cap counts base only.
         assertEq(_phaseSold(0), CAP);
-
         // Charged only the exact cost: 10,000,000 * 5000 / 1e18 (in 6 decimals) = 50,000 USDC.
         uint256 required = (CAP * 5000) / 1e18;
         assertEq(required, 50_000 * 1e6);
         assertEq(usdc.balanceOf(address(presale)), required);
         // Buyer keeps the unspent 10,000 USDC.
         assertEq(usdc.balanceOf(alice), amount - required);
+
+        // The charged $50k crosses all three stacking bonus tiers (+600k CON), booked on top of base.
+        assertEq(presale.contributedUsd(alice), required);
+        assertEq(presale.bonusTiersAwarded(alice), 3);
+        assertEq(presale.purchased(alice), CAP + 600_000 * 1e18);
     }
 
     function test_BuyRevertsWhenPhaseSoldOut() public {
@@ -623,6 +626,198 @@ contract PresaleTest is Test {
         presale.acceptOwnership();
         assertEq(presale.owner(), bob);
         assertEq(presale.pendingOwner(), address(0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                             STACKING BONUS
+    //////////////////////////////////////////////////////////////*/
+
+    uint256 internal constant PRESALE_CAP = 50_000_000 * 1e18;
+    uint256 internal constant TIER1_CON = 50_000 * 1e18;
+    uint256 internal constant TIER2_CON = 150_000 * 1e18;
+    uint256 internal constant TIER3_CON = 400_000 * 1e18;
+
+    function test_BonusSingleBuy10kAwardsTier1() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 10_000 * 1e6); // $10k @ $0.005 -> 2,000,000 base
+
+        uint256 base = (10_000 * 1e6 * 1e18) / 5000;
+        assertEq(base, 2_000_000 * 1e18);
+        assertEq(presale.purchased(alice), base + TIER1_CON);
+        assertEq(presale.bonusTiersAwarded(alice), 1);
+        assertEq(presale.contributedUsd(alice), 10_000 * 1e6);
+        // Bonus is booked into totals but NOT into the phase cap.
+        assertEq(_phaseSold(0), base);
+        assertEq(presale.totalSold(), base + TIER1_CON);
+    }
+
+    function test_BonusSingleBuy25kStacksTwoTiers() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 25_000 * 1e6);
+
+        uint256 base = (25_000 * 1e6 * 1e18) / 5000; // 5,000,000
+        assertEq(presale.purchased(alice), base + TIER1_CON + TIER2_CON); // +200k
+        assertEq(presale.bonusTiersAwarded(alice), 2);
+    }
+
+    function test_BonusSingleBuy50kStacksAllTiers() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 50_000 * 1e6);
+
+        uint256 base = (50_000 * 1e6 * 1e18) / 5000; // 10,000,000 == phase cap
+        assertEq(base, CAP);
+        assertEq(presale.purchased(alice), base + 600_000 * 1e18); // +600k
+        assertEq(presale.bonusTiersAwarded(alice), 3);
+        assertEq(_phaseSold(0), CAP);
+        assertEq(presale.totalSold(), CAP + 600_000 * 1e18);
+    }
+
+    function test_BonusIsClaimable() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 10_000 * 1e6);
+        uint256 owed = presale.purchased(alice);
+
+        vm.prank(admin);
+        presale.enableClaim();
+        vm.prank(alice);
+        presale.claim();
+
+        assertEq(con.balanceOf(alice), owed);
+        assertEq(con.balanceOf(alice), 2_000_000 * 1e18 + TIER1_CON);
+    }
+
+    function test_BonusStepwiseAwardsEachTierOnce() public {
+        _startPhase(0, LONG);
+
+        // $5k: below tier 1 -> no bonus.
+        _buyStable(alice, usdc, 5000 * 1e6);
+        assertEq(presale.bonusTiersAwarded(alice), 0);
+        assertEq(presale.purchased(alice), 1_000_000 * 1e18);
+
+        // +$5k (=$10k): crosses tier 1 -> +50k.
+        _buyStable(alice, usdc, 5000 * 1e6);
+        assertEq(presale.bonusTiersAwarded(alice), 1);
+        assertEq(presale.purchased(alice), 2_000_000 * 1e18 + TIER1_CON);
+
+        // +$15k (=$25k): crosses tier 2 -> +150k.
+        _buyStable(alice, usdc, 15_000 * 1e6);
+        assertEq(presale.bonusTiersAwarded(alice), 2);
+        assertEq(presale.purchased(alice), 5_000_000 * 1e18 + TIER1_CON + TIER2_CON);
+
+        // +$25k (=$50k): crosses tier 3 -> +400k. Base now exactly the 10M phase cap.
+        _buyStable(alice, usdc, 25_000 * 1e6);
+        assertEq(presale.bonusTiersAwarded(alice), 3);
+        assertEq(presale.purchased(alice), CAP + 600_000 * 1e18);
+        assertEq(_phaseSold(0), CAP);
+    }
+
+    function test_BonusNotReAwardedOnceAtTopTier() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 50_000 * 1e6); // tier 3, fills phase 0 base cap
+        uint256 purchasedAfterP0 = presale.purchased(alice);
+        assertEq(presale.bonusTiersAwarded(alice), 3);
+
+        // Move to phase 1 and contribute more: no further bonus, tier stays 3.
+        _startPhase(1, LONG);
+        _buyStable(alice, usdc, 10_000 * 1e6); // $10k @ $0.006
+        uint256 amtP1 = 10_000 * 1e6;
+        uint256 baseP1 = (amtP1 * 1e18) / 6000;
+
+        assertEq(presale.bonusTiersAwarded(alice), 3);
+        assertEq(presale.purchased(alice), purchasedAfterP0 + baseP1);
+        assertEq(presale.contributedUsd(alice), 60_000 * 1e6);
+    }
+
+    function test_BonusViaETHDrivesTiers() public {
+        _startPhase(0, LONG);
+        // $2000/ETH: 5 ETH == $10,000 -> crosses tier 1.
+        vm.deal(alice, 5 ether);
+        vm.prank(alice);
+        presale.buyWithETH{value: 5 ether}();
+
+        uint256 base = (10_000 * 1e6 * 1e18) / 5000; // 2,000,000
+        assertEq(presale.purchased(alice), base + TIER1_CON);
+        assertEq(presale.bonusTiersAwarded(alice), 1);
+        assertEq(presale.contributedUsd(alice), 10_000 * 1e6);
+    }
+
+    function test_BonusAwardedEventEmitted() public {
+        _startPhase(0, LONG);
+        usdc.mint(alice, 10_000 * 1e6);
+        vm.startPrank(alice);
+        usdc.approve(address(presale), 10_000 * 1e6);
+        vm.expectEmit(true, false, false, true, address(presale));
+        emit Presale.BonusAwarded(alice, TIER1_CON, 1);
+        presale.buyWithStable(IERC20(address(usdc)), 10_000 * 1e6);
+        vm.stopPrank();
+    }
+
+    function test_PreviewMatchesActualStable() public {
+        _startPhase(0, LONG);
+
+        (uint256 baseCon, uint256 bonusCon, uint8 newTier) = presale.previewPurchase(alice, 25_000 * 1e6);
+        _buyStable(alice, usdc, 25_000 * 1e6);
+
+        assertEq(presale.purchased(alice), baseCon + bonusCon);
+        assertEq(presale.bonusTiersAwarded(alice), newTier);
+
+        // A second preview accounts for the already-credited contribution.
+        (uint256 baseCon2, uint256 bonusCon2, uint8 newTier2) = presale.previewPurchase(alice, 25_000 * 1e6);
+        uint256 before = presale.purchased(alice);
+        _buyStable(alice, usdc, 25_000 * 1e6);
+        assertEq(presale.purchased(alice) - before, baseCon2 + bonusCon2);
+        assertEq(presale.bonusTiersAwarded(alice), newTier2);
+        assertEq(newTier2, 3);
+    }
+
+    function test_PreviewMatchesActualETH() public {
+        _startPhase(0, LONG);
+        uint256 usdE6 = (5 ether * uint256(ETH_PRICE)) / 1e20; // $10k
+
+        (uint256 baseCon, uint256 bonusCon, uint8 newTier) = presale.previewPurchase(alice, usdE6);
+        vm.deal(alice, 5 ether);
+        vm.prank(alice);
+        presale.buyWithETH{value: 5 ether}();
+
+        assertEq(presale.purchased(alice), baseCon + bonusCon);
+        assertEq(presale.bonusTiersAwarded(alice), newTier);
+    }
+
+    function test_BonusTiersView() public view {
+        (uint256[3] memory usd, uint256[3] memory con_) = presale.bonusTiers();
+        assertEq(usd[0], 10_000 * 1e6);
+        assertEq(usd[1], 25_000 * 1e6);
+        assertEq(usd[2], 50_000 * 1e6);
+        assertEq(con_[0], TIER1_CON);
+        assertEq(con_[1], TIER2_CON);
+        assertEq(con_[2], TIER3_CON);
+    }
+
+    function test_GlobalCapNeverExceededAndBlocksFurtherBuys() public {
+        uint256[5] memory prices = [uint256(5000), 6000, 7000, 8000, 9000];
+        for (uint8 i = 0; i < 5; ++i) {
+            _startPhase(i, LONG);
+            address whale = makeAddr(string(abi.encodePacked("whale", i)));
+            // Enough to fill the 10M base cap at this phase price (and cross all bonus tiers).
+            uint256 amount = 10_000_000 * prices[i];
+            usdc.mint(whale, amount);
+            vm.startPrank(whale);
+            usdc.approve(address(presale), amount);
+            presale.buyWithStable(IERC20(address(usdc)), amount);
+            vm.stopPrank();
+            assertLe(presale.totalSold(), PRESALE_CAP);
+        }
+
+        // base (5 x 10M would be 50M) + bonuses are clamped so the global cap is hit exactly.
+        assertEq(presale.totalSold(), PRESALE_CAP);
+
+        // The global cap now blocks any further purchase, even though phase 4 base has room.
+        usdc.mint(bob, 1000 * 1e6);
+        vm.startPrank(bob);
+        usdc.approve(address(presale), 1000 * 1e6);
+        vm.expectRevert(Presale.PresaleCapReached.selector);
+        presale.buyWithStable(IERC20(address(usdc)), 1000 * 1e6);
+        vm.stopPrank();
     }
 
     /*//////////////////////////////////////////////////////////////

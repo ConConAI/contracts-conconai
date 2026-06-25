@@ -20,7 +20,9 @@ import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 ///         - `ReentrancyGuard` on all value-moving entry points, `SafeERC20` everywhere.
 ///         - One-way `presaleEnded` / `claimOpen` flags that the owner can never unset.
 ///         - The owner can never mutate `purchased`, reverse a claim, or touch buyers' $CON.
-///         A professional security audit is required before mainnet use.
+///         Buyers also earn one-time, stacking purchase bonuses (see {bonusTiers}); bonuses are pure
+///         internal bookings (no external call) and, together with base sales, can never push
+///         `totalSold` above {PRESALE_CAP}. A professional security audit is required before mainnet.
 contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -51,6 +53,25 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice CON cap per phase: 10,000,000 CON (18 decimals).
     uint256 public constant PHASE_CAP = 10_000_000 * 1e18;
+
+    /// @notice Hard global cap on total booked CON (base + stacking bonuses), 18 decimals.
+    /// @dev `totalSold` (base + bonus) can never exceed this; the deployer funds the presale with
+    ///      exactly this amount so every booked allocation (including bonuses) is claimable.
+    uint256 public constant PRESALE_CAP = 50_000_000 * 1e18;
+
+    /// @notice Number of one-time, stacking purchase-bonus tiers.
+    uint8 public constant NUM_BONUS_TIERS = 3;
+
+    /// @notice Cumulative USD(1e6) a buyer must contribute to unlock bonus tier 1 / 2 / 3.
+    uint256 internal constant BONUS_TIER1_USD = 10_000 * 1e6;
+    uint256 internal constant BONUS_TIER2_USD = 25_000 * 1e6;
+    uint256 internal constant BONUS_TIER3_USD = 50_000 * 1e6;
+
+    /// @notice Extra CON(1e18) granted when a buyer first crosses bonus tier 1 / 2 / 3 (each once).
+    /// @dev Stacking: reaching $50k yields 50k + 150k + 400k = 600,000 CON in total bonuses.
+    uint256 internal constant BONUS_TIER1_CON = 50_000 * 1e18;
+    uint256 internal constant BONUS_TIER2_CON = 150_000 * 1e18;
+    uint256 internal constant BONUS_TIER3_CON = 400_000 * 1e18;
 
     /// @notice USD scaling factor (1 USD == 1e6), matching 6-decimal stablecoins.
     uint256 internal constant USD_SCALE = 1e6;
@@ -112,6 +133,14 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Total CON already claimed by buyers.
     uint256 public totalClaimed;
 
+    /// @notice Cumulative USD(1e6) each buyer has actually paid in (stables 1:1, ETH via the oracle).
+    /// @dev Drives the stacking bonus tiers; only the amount actually charged is counted.
+    mapping(address buyer => uint256 usdE6) public contributedUsd;
+
+    /// @notice Number of bonus tiers already awarded to each buyer (0..{NUM_BONUS_TIERS}).
+    /// @dev Monotonic; ensures each tier is granted at most once per buyer.
+    mapping(address buyer => uint8 tiers) public bonusTiersAwarded;
+
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
     //////////////////////////////////////////////////////////////*/
@@ -125,6 +154,12 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     event Purchased(
         address indexed buyer, uint8 indexed phaseIndex, uint256 conAmount, address indexed asset, uint256 paid
     );
+
+    /// @notice Emitted when a buyer crosses one or more stacking bonus tiers.
+    /// @param buyer The purchaser receiving the bonus.
+    /// @param bonusCon Extra CON booked for the newly crossed tier(s) (after any global-cap clamp).
+    /// @param newTier The buyer's bonus tier count after this award (0..{NUM_BONUS_TIERS}).
+    event BonusAwarded(address indexed buyer, uint256 bonusCon, uint8 newTier);
 
     /// @notice Emitted when a buyer claims their allocation.
     event Claimed(address indexed buyer, uint256 conAmount);
@@ -162,6 +197,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     error PresaleIsEnded();
     error PhaseExpired();
     error PhaseSoldOut();
+    error PresaleCapReached();
     error UnsupportedStable();
     error ZeroConAmount();
     error ZeroPayment();
@@ -236,8 +272,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 price = phase.priceUsdE6;
         uint256 conAmount = (amount * CON_SCALE) / price;
 
-        uint256 remaining = phase.cap - phase.sold;
-        if (remaining == 0) revert PhaseSoldOut();
+        uint256 remaining = _baseRemaining(phase);
 
         uint256 charge = amount;
         if (conAmount > remaining) {
@@ -249,6 +284,9 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
 
         _book(msg.sender, phaseIndex, conAmount);
         emit Purchased(msg.sender, phaseIndex, conAmount, address(stable), charge);
+
+        // Stables are 1:1 USD with 6 decimals, so the charged amount IS the USD(1e6) contributed.
+        _awardBonus(msg.sender, charge);
 
         stable.safeTransferFrom(msg.sender, address(this), charge);
     }
@@ -270,8 +308,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 usdE6 = (msg.value * ethUsd) / ETH_USD_SCALE;
         uint256 conAmount = (usdE6 * CON_SCALE) / price;
 
-        uint256 remaining = phase.cap - phase.sold;
-        if (remaining == 0) revert PhaseSoldOut();
+        uint256 remaining = _baseRemaining(phase);
         if (conAmount > remaining) {
             conAmount = remaining;
         }
@@ -288,6 +325,9 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
 
         _book(msg.sender, phaseIndex, conAmount);
         emit Purchased(msg.sender, phaseIndex, conAmount, address(0), requiredEth);
+
+        // Only the USD actually charged (for the possibly clamped CON) counts toward bonus tiers.
+        _awardBonus(msg.sender, requiredUsdE6);
 
         if (refund > 0) {
             (bool ok,) = msg.sender.call{value: refund}("");
@@ -447,7 +487,60 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     function isBuyingActive() external view returns (bool active) {
         Phase storage phase = phases[currentPhase];
         // forge-lint: disable-next-line(block-timestamp) - timed phase window is intentional.
-        return phase.started && !presaleEnded && !paused() && block.timestamp <= phase.endsAt && phase.sold < phase.cap;
+        return phase.started && !presaleEnded && !paused() && block.timestamp <= phase.endsAt && phase.sold < phase.cap
+            && totalSold < PRESALE_CAP;
+    }
+
+    /// @notice Preview the base + stacking-bonus CON a buyer would receive for spending `usdE6`.
+    /// @dev Pure view (no state change). Mirrors the buy path: base is priced at the current phase
+    ///      price and clamped to the phase and global caps; only the USD actually charged drives the
+    ///      one-time, stacking bonus, which is itself clamped to the remaining global cap.
+    /// @param buyer The buyer whose existing contribution/awarded tiers are considered.
+    /// @param usdE6 The USD amount to spend, scaled by 1e6 (for ETH, pass the oracle-derived USD).
+    /// @return baseCon Base CON booked for the spend (18 decimals), after cap clamping.
+    /// @return bonusCon Extra CON from any newly crossed bonus tiers (18 decimals).
+    /// @return newTier The buyer's resulting bonus tier count (0..{NUM_BONUS_TIERS}).
+    function previewPurchase(address buyer, uint256 usdE6)
+        external
+        view
+        returns (uint256 baseCon, uint256 bonusCon, uint8 newTier)
+    {
+        Phase storage phase = phases[currentPhase];
+        uint256 price = phase.priceUsdE6;
+
+        baseCon = (usdE6 * CON_SCALE) / price;
+
+        uint256 phaseRemaining = phase.cap - phase.sold;
+        uint256 globalRemaining = PRESALE_CAP - totalSold;
+        uint256 remaining = phaseRemaining < globalRemaining ? phaseRemaining : globalRemaining;
+
+        uint256 chargedUsdE6 = usdE6;
+        if (baseCon > remaining) {
+            baseCon = remaining;
+            chargedUsdE6 = (baseCon * price) / CON_SCALE;
+        }
+
+        uint8 awarded = bonusTiersAwarded[buyer];
+        newTier = _tiersFor(contributedUsd[buyer] + chargedUsdE6);
+        if (newTier > awarded) {
+            for (uint8 t = awarded; t < newTier; ++t) {
+                bonusCon += _tierCon(t);
+            }
+            uint256 remainingAfterBase = globalRemaining - baseCon;
+            if (bonusCon > remainingAfterBase) bonusCon = remainingAfterBase;
+        }
+    }
+
+    /// @notice The bonus-tier thresholds and amounts.
+    /// @return usdThresholds Cumulative USD(1e6) needed to unlock each tier.
+    /// @return conAmounts Extra CON(1e18) granted for crossing each tier.
+    function bonusTiers()
+        external
+        pure
+        returns (uint256[NUM_BONUS_TIERS] memory usdThresholds, uint256[NUM_BONUS_TIERS] memory conAmounts)
+    {
+        usdThresholds = [BONUS_TIER1_USD, BONUS_TIER2_USD, BONUS_TIER3_USD];
+        conAmounts = [BONUS_TIER1_CON, BONUS_TIER2_CON, BONUS_TIER3_CON];
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -463,11 +556,64 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         if (block.timestamp > phase.endsAt) revert PhaseExpired();
     }
 
-    /// @dev Applies the booking effects for a purchase (no external interaction).
+    /// @dev Applies the booking effects for a base purchase (no external interaction).
     function _book(address buyer, uint8 phaseIndex, uint256 conAmount) internal {
         purchased[buyer] += conAmount;
         phases[phaseIndex].sold += conAmount;
         totalSold += conAmount;
+    }
+
+    /// @dev CON still sellable as *base* right now: min of the phase cap and the global cap.
+    ///      Reverts if either the phase ({PhaseSoldOut}) or the presale ({PresaleCapReached}) is full.
+    function _baseRemaining(Phase storage phase) internal view returns (uint256 remaining) {
+        uint256 phaseRemaining = phase.cap - phase.sold;
+        if (phaseRemaining == 0) revert PhaseSoldOut();
+        uint256 globalRemaining = PRESALE_CAP - totalSold;
+        if (globalRemaining == 0) revert PresaleCapReached();
+        remaining = phaseRemaining < globalRemaining ? phaseRemaining : globalRemaining;
+    }
+
+    /// @dev Credits `usdE6Added` to the buyer's running total and books any newly crossed bonus
+    ///      tiers. Pure internal booking: bonuses go to `purchased`/`totalSold` only (never a phase
+    ///      cap) and are clamped to the remaining global cap. No external interaction (CEI-safe).
+    function _awardBonus(address buyer, uint256 usdE6Added) internal {
+        uint256 contributed = contributedUsd[buyer] + usdE6Added;
+        contributedUsd[buyer] = contributed;
+
+        uint8 awarded = bonusTiersAwarded[buyer];
+        uint8 reached = _tiersFor(contributed);
+        if (reached <= awarded) return;
+
+        uint256 bonus;
+        for (uint8 t = awarded; t < reached; ++t) {
+            bonus += _tierCon(t);
+        }
+
+        // Bonuses count against the global cap only; clamp near sellout so totalSold <= PRESALE_CAP.
+        uint256 globalRemaining = PRESALE_CAP - totalSold;
+        if (bonus > globalRemaining) bonus = globalRemaining;
+
+        bonusTiersAwarded[buyer] = reached;
+        if (bonus > 0) {
+            purchased[buyer] += bonus;
+            totalSold += bonus;
+        }
+        emit BonusAwarded(buyer, bonus, reached);
+    }
+
+    /// @dev Number of bonus tiers unlocked by a cumulative contribution of `usdE6` (0..3).
+    function _tiersFor(uint256 usdE6) internal pure returns (uint8 tiers) {
+        if (usdE6 >= BONUS_TIER3_USD) return 3;
+        if (usdE6 >= BONUS_TIER2_USD) return 2;
+        if (usdE6 >= BONUS_TIER1_USD) return 1;
+        return 0;
+    }
+
+    /// @dev Bonus CON granted for crossing the tier at `tierIndex` (0-based).
+    function _tierCon(uint8 tierIndex) internal pure returns (uint256) {
+        if (tierIndex == 0) return BONUS_TIER1_CON;
+        if (tierIndex == 1) return BONUS_TIER2_CON;
+        return BONUS_TIER3_CON;
     }
 
     /// @dev Reads and validates the ETH/USD price (8-decimal answer), reverting on bad/stale data.
