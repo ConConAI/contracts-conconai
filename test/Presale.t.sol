@@ -362,6 +362,7 @@ contract PresaleTest is Test {
 
         assertEq(con.balanceOf(alice), amt);
         assertEq(presale.purchased(alice), 0);
+        assertEq(presale.claimed(alice), amt);
         assertEq(presale.totalClaimed(), amt);
         assertEq(con.balanceOf(address(presale)), FUND - amt);
     }
@@ -372,11 +373,20 @@ contract PresaleTest is Test {
         vm.prank(admin);
         presale.enableClaim();
 
+        uint256 amt = presale.purchased(alice);
         vm.prank(alice);
         presale.claim();
+
+        // Claimed tracker reflects the claim and the allocation is zeroed.
+        assertEq(presale.claimed(alice), amt);
+        assertEq(presale.purchased(alice), 0);
+
         vm.prank(alice);
         vm.expectRevert(Presale.NothingToClaim.selector);
         presale.claim();
+
+        // A reverted double-claim does not change the tracker.
+        assertEq(presale.claimed(alice), amt);
     }
 
     function test_ClaimRevertsForZeroAllocation() public {

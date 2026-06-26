@@ -127,6 +127,11 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @notice Booked CON allocation per buyer (18 decimals); set to 0 on claim.
     mapping(address buyer => uint256 conAmount) public purchased;
 
+    /// @notice CON already claimed by each buyer (18 decimals); lets the frontend distinguish
+    ///         "claimable" (`purchased > 0`) from "already claimed" (`claimed > 0 && purchased == 0`).
+    /// @dev Informational mirror of claims; does not affect any accounting.
+    mapping(address buyer => uint256 amount) public claimed;
+
     /// @notice Total CON booked across all buyers and phases.
     uint256 public totalSold;
 
@@ -347,6 +352,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         if (amount == 0) revert NothingToClaim();
 
         purchased[msg.sender] = 0;
+        claimed[msg.sender] += amount;
         totalClaimed += amount;
 
         emit Claimed(msg.sender, amount);
