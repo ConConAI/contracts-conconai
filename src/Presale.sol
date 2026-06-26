@@ -191,7 +191,6 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
 
     error ZeroAddress();
     error InvalidPhaseIndex();
-    error NonSequentialPhase();
     error ZeroDuration();
     error PhaseNotStarted();
     error PresaleIsEnded();
@@ -359,14 +358,13 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Start (or restart) a phase, activating it and setting its timer.
-    /// @dev Phases must advance sequentially: `i` may equal the current phase or the next one. Cannot
-    ///      be called once the presale has ended.
-    /// @param i Phase index to start (must be `currentPhase` or `currentPhase + 1`).
+    /// @dev The owner may activate ANY valid phase index (0..{NUM_PHASES}-1) in any order, allowing
+    ///      free switching (forward or backward). Cannot be called once the presale has ended.
+    /// @param i Phase index to start (any valid index `0..NUM_PHASES-1`).
     /// @param duration Seconds from now until the phase closes.
     function startPhase(uint8 i, uint64 duration) external onlyOwner {
         if (presaleEnded) revert PresaleIsEnded();
         if (i >= NUM_PHASES) revert InvalidPhaseIndex();
-        if (i != currentPhase && i != currentPhase + 1) revert NonSequentialPhase();
         if (duration == 0) revert ZeroDuration();
 
         // forge-lint: disable-next-line(unsafe-typecast) - block.timestamp fits in uint64 for millennia.

@@ -487,18 +487,26 @@ contract PresaleTest is Test {
                           ADMIN / PHASE CONTROL
     //////////////////////////////////////////////////////////////*/
 
-    function test_StartPhaseSequentialOnly() public {
-        vm.prank(admin);
-        vm.expectRevert(Presale.NonSequentialPhase.selector);
-        presale.startPhase(2, LONG); // skipping from 0 to 2
+    function test_StartPhaseAllowsFreeSwitching() public {
+        // Owner can jump straight to any phase (0 -> 2), no sequential restriction.
+        _startPhase(2, LONG);
+        assertEq(presale.currentPhase(), 2);
 
-        _startPhase(0, LONG);
+        // Buying in the jumped-to phase uses that phase's price ($0.007 -> 1000 CON for $7).
+        _buyStable(alice, usdc, 7_000_000);
+        assertEq(presale.purchased(alice), 1000 * 1e18);
+
+        // Can jump forward again (2 -> 4).
+        _startPhase(4, LONG);
+        assertEq(presale.currentPhase(), 4);
+
+        // Can go backwards (4 -> 1).
         _startPhase(1, LONG);
         assertEq(presale.currentPhase(), 1);
 
-        vm.prank(admin);
-        vm.expectRevert(Presale.NonSequentialPhase.selector);
-        presale.startPhase(0, LONG); // cannot go backwards
+        // Restarting the active phase is allowed too.
+        _startPhase(1, LONG);
+        assertEq(presale.currentPhase(), 1);
     }
 
     function test_StartPhaseRevertsOnInvalidIndex() public {
