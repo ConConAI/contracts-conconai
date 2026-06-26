@@ -13,12 +13,12 @@
   },
   "sepolia": {
     "chainId": 11155111,
-    "token": "0x2b46b7ADE321F2aaBfF0C9301e22210Ad9Ab0B43",
+    "token": "0x92D0d667C76643e121610B1B186bbde3762bDC39",
     "admin": "0x6EA38ea652ED642608796c81802FDb19c6342A1f",
-    "presale": "0x671fa7Cf9998b22D5d6585E4C629D74FE6E1eAa8",
-    "usdc": "0x2EdBDa9e5E03964302D3c0b63afEDB90C01Be98a",
-    "usdt": "0x90C6Ebd8F477f7703890987d176BF3333D0D9D64",
-    "ethUsdFeed": "0xE776F3bcb64eeb772E9291cfa08Eb6628b3D63d2",
+    "presale": "0xe8Eb863FCcBbe82E757c1A9941b6cf8e7049c715",
+    "usdc": "0xdA6Be46f32099eEAa2eEb56801e7a304a1CA7DF0",
+    "usdt": "0x278c751667cb62939A7761b9496D3fEBB210D0AF",
+    "ethUsdFeed": "0xad4D53D5a28BdaC2978eAf99d73E5c2Cb2Ee9A8D",
     "_note": "TESTNET ONLY: test ConToken copy + freely-mintable mock stables + mock Chainlink ETH/USD aggregator, deployed via DeploySepoliaTestEnv. Presale funded with 50,000,000 test CON. admin is a disposable Sepolia test wallet."
   }
 }
