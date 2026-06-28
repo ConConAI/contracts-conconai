@@ -487,9 +487,11 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         return totalSold - totalClaimed;
     }
 
-    /// @notice Remaining CON sellable in the active phase, clamped to the global cap.
+    /// @notice Remaining CON sellable in the active phase, clamped to the global base+bonus cap.
     /// @dev Returns the minimum of the phase remaining (`phase.cap - phase.sold`) and the global
-    ///      remaining (`PRESALE_CAP - totalSold`, which already accounts for bonuses).
+    ///      remaining (`PRESALE_CAP - totalSold`). The returned value reflects the global
+    ///      `PRESALE_CAP`, which already accounts for both base sales and awarded bonuses, so it is
+    ///      never larger than what can actually still be sold.
     /// @return The CON still sellable right now (18 decimals).
     function remainingInActivePhase() external view returns (uint256) {
         Phase storage phase = phases[currentPhase];
