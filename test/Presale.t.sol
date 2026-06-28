@@ -459,6 +459,10 @@ contract PresaleTest is Test {
         _buyStable(alice, usdc, 5_000_000); // books 1000 CON
         uint256 outstanding = presale.totalSold();
 
+        // Unsold CON can only be swept once the presale has ended.
+        vm.prank(admin);
+        presale.endPresale();
+
         uint256 treasuryBefore = con.balanceOf(admin);
         vm.prank(admin);
         presale.sweepUnsold();
@@ -488,9 +492,46 @@ contract PresaleTest is Test {
         vm.stopPrank();
         con.mint(address(p), p.totalSold()); // fund exactly outstanding
 
-        vm.prank(admin);
+        vm.startPrank(admin);
+        p.endPresale();
         vm.expectRevert(Presale.NothingToSweep.selector);
         p.sweepUnsold();
+        vm.stopPrank();
+    }
+
+    function test_SweepRevertsBeforePresaleEnded() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 5_000_000); // books 1000 CON, leaving plenty of excess CON
+
+        // Even with excess CON present, sweeping is blocked until the presale ends.
+        vm.prank(admin);
+        vm.expectRevert(Presale.PresaleNotEnded.selector);
+        presale.sweepUnsold();
+    }
+
+    function test_RemainingInActivePhaseClampedToGlobalCap() public {
+        uint256[4] memory prices = [uint256(5000), 6000, 7000, 8000];
+        for (uint8 i = 0; i < 4; ++i) {
+            _startPhase(i, LONG);
+            address whale = makeAddr(string(abi.encodePacked("capwhale", i)));
+            uint256 amount = 10_000_000 * prices[i]; // fills the 10M base cap at this phase price
+            usdc.mint(whale, amount);
+            vm.startPrank(whale);
+            usdc.approve(address(presale), amount);
+            presale.buyWithStable(IERC20(address(usdc)), amount);
+            vm.stopPrank();
+        }
+
+        // 4 phases filled: 40M base + 4 x 600k bonus = 42.4M sold; global remaining = 7.6M.
+        _startPhase(4, LONG);
+        uint256 globalRemaining = PRESALE_CAP - presale.totalSold();
+        assertEq(globalRemaining, 7_600_000 * 1e18);
+
+        // Phase 4 still has the full 10M base room, but the view is clamped to the global remaining.
+        (, uint256 cap4, uint256 sold4,,) = presale.phases(4);
+        assertEq(cap4 - sold4, CAP);
+        assertEq(presale.remainingInActivePhase(), globalRemaining);
+        assertLt(presale.remainingInActivePhase(), cap4 - sold4);
     }
 
     /*//////////////////////////////////////////////////////////////

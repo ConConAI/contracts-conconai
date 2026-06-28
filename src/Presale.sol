@@ -215,6 +215,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     error CannotWithdrawConToken();
     error NothingToWithdraw();
     error NothingToSweep();
+    error PresaleNotEnded();
     error EthTransferFailed();
 
     /*//////////////////////////////////////////////////////////////
@@ -457,9 +458,11 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     /// @notice Sweep only the EXCESS (unsold) $CON to the treasury, always leaving claimers covered.
-    /// @dev Excess = `balanceOf(this) - (totalSold - totalClaimed)`. Reverts if there is nothing to
-    ///      sweep, guaranteeing outstanding claims remain fully backed.
+    /// @dev Excess = `balanceOf(this) - (totalSold - totalClaimed)`. Only callable once the presale has
+    ///      ended (so buying can no longer create new claims after a sweep). Reverts if there is nothing
+    ///      to sweep, guaranteeing outstanding claims remain fully backed.
     function sweepUnsold() external onlyOwner nonReentrant {
+        if (!presaleEnded) revert PresaleNotEnded();
         uint256 outstanding = totalSold - totalClaimed;
         uint256 balance = CON_TOKEN.balanceOf(address(this));
         if (balance <= outstanding) revert NothingToSweep();
@@ -479,11 +482,15 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         return totalSold - totalClaimed;
     }
 
-    /// @notice Remaining CON sellable in the active phase.
-    /// @return The active phase's remaining cap (18 decimals).
+    /// @notice Remaining CON sellable in the active phase, clamped to the global cap.
+    /// @dev Returns the minimum of the phase remaining (`phase.cap - phase.sold`) and the global
+    ///      remaining (`PRESALE_CAP - totalSold`, which already accounts for bonuses).
+    /// @return The CON still sellable right now (18 decimals).
     function remainingInActivePhase() external view returns (uint256) {
         Phase storage phase = phases[currentPhase];
-        return phase.cap - phase.sold;
+        uint256 phaseRemaining = phase.cap - phase.sold;
+        uint256 globalRemaining = PRESALE_CAP - totalSold;
+        return phaseRemaining < globalRemaining ? phaseRemaining : globalRemaining;
     }
 
     /// @notice Whether buying is currently possible in the active phase.
