@@ -600,12 +600,32 @@ contract PresaleTest is Test {
         _startPhase(0, LONG);
         vm.prank(admin);
         presale.endPhase();
-        assertEq(_phaseEndsAt(0), uint64(block.timestamp));
+        // L-01: endsAt is set one second in the past so the phase is already expired.
+        assertEq(_phaseEndsAt(0), uint64(block.timestamp) - 1);
 
         vm.warp(block.timestamp + 1);
         vm.prank(alice);
         vm.expectRevert(Presale.PhaseExpired.selector);
         presale.buyWithStable(IERC20(address(usdc)), 1e6);
+    }
+
+    function test_EndPhaseBlocksSameBlockBuy() public {
+        _startPhase(0, LONG);
+        vm.prank(admin);
+        presale.endPhase();
+
+        // L-01: in the SAME block as endPhase() (no time warp), buys must already revert.
+        usdc.mint(alice, 1e6);
+        vm.startPrank(alice);
+        usdc.approve(address(presale), 1e6);
+        vm.expectRevert(Presale.PhaseExpired.selector);
+        presale.buyWithStable(IERC20(address(usdc)), 1e6);
+        vm.stopPrank();
+
+        vm.deal(bob, 1 ether);
+        vm.prank(bob);
+        vm.expectRevert(Presale.PhaseExpired.selector);
+        presale.buyWithETH{value: 1 ether}();
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -798,6 +818,26 @@ contract PresaleTest is Test {
         assertEq(presale.purchased(alice), base + TIER1_CON);
         assertEq(presale.bonusTiersAwarded(alice), 1);
         assertEq(presale.contributedUsd(alice), 10_000 * 1e6);
+    }
+
+    function test_ExactThresholdETHBuyUnlocksTier1() public {
+        // L-02: at phase 1 ($0.006) the CON->USD back-conversion floors a few micro-dollars below the
+        // sent value. An ETH buy worth exactly $10,000 must still unlock tier 1 (full USD credited).
+        _startPhase(1, LONG);
+
+        uint256 usdE6 = (5 ether * uint256(ETH_PRICE)) / 1e20; // exactly 10_000e6 == BONUS_TIER1_USD
+        assertEq(usdE6, 10_000 * 1e6);
+
+        vm.deal(alice, 5 ether);
+        vm.prank(alice);
+        presale.buyWithETH{value: 5 ether}();
+
+        // Full USD value is credited (not the floor-rounded requiredUsdE6), so tier 1 unlocks.
+        assertEq(presale.contributedUsd(alice), 10_000 * 1e6);
+        assertEq(presale.bonusTiersAwarded(alice), 1);
+
+        uint256 base = (usdE6 * 1e18) / 6000;
+        assertEq(presale.purchased(alice), base + TIER1_CON);
     }
 
     function test_BonusAwardedEventEmitted() public {

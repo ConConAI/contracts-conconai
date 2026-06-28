@@ -314,7 +314,8 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         uint256 conAmount = (usdE6 * CON_SCALE) / price;
 
         uint256 remaining = _baseRemaining(phase);
-        if (conAmount > remaining) {
+        bool clamped = conAmount > remaining; // L-02: capture before clamping
+        if (clamped) {
             conAmount = remaining;
         }
         if (conAmount == 0) revert ZeroConAmount();
@@ -331,8 +332,10 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         _book(msg.sender, phaseIndex, conAmount);
         emit Purchased(msg.sender, phaseIndex, conAmount, address(0), requiredEth);
 
-        // Only the USD actually charged (for the possibly clamped CON) counts toward bonus tiers.
-        _awardBonus(msg.sender, requiredUsdE6);
+        // L-02: credit the full USD value of the ETH when unclamped (floor rounding on the
+        // CON->USD step must not drop a buyer a micro-dollar below a bonus tier); when clamped,
+        // credit the exact USD charged for the booked CON.
+        _awardBonus(msg.sender, clamped ? requiredUsdE6 : usdE6);
 
         if (refund > 0) {
             (bool ok,) = msg.sender.call{value: refund}("");
@@ -408,7 +411,9 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         if (!phase.started) revert PhaseNotStarted();
         // forge-lint: disable-next-line(unsafe-typecast) - block.timestamp fits in uint64 for millennia.
         uint64 nowTs = uint64(block.timestamp);
-        phase.endsAt = nowTs;
+        // L-01: mark already-expired (nowTs - 1) so a buy in THIS block can no longer slip in at the
+        // old phase price. nowTs is always far greater than 1, so this cannot underflow.
+        phase.endsAt = nowTs - 1;
         emit PhaseEnded(currentPhase, nowTs);
     }
 
