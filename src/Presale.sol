@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -73,9 +74,6 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     uint256 internal constant BONUS_TIER2_CON = 150_000 * 1e18;
     uint256 internal constant BONUS_TIER3_CON = 400_000 * 1e18;
 
-    /// @notice USD scaling factor (1 USD == 1e6), matching 6-decimal stablecoins.
-    uint256 internal constant USD_SCALE = 1e6;
-
     /// @notice CON has 18 decimals; used to scale conAmount math.
     uint256 internal constant CON_SCALE = 1e18;
 
@@ -107,6 +105,16 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice Treasury that receives raised funds and swept/unsold $CON (equals the owner/admin).
     address public immutable TREASURY;
+
+    /// @notice Unix timestamp at/after which buying is permanently closed (hard sale end).
+    /// @dev No purchase can execute once `block.timestamp >= SALE_HARD_END`, regardless of any phase
+    ///      timer the owner may set.
+    uint256 public immutable SALE_HARD_END;
+
+    /// @notice Unix timestamp at/after which claiming is automatically available to every buyer.
+    /// @dev Claiming auto-opens at this time even if {enableClaim} was never called, so the owner can
+    ///      never withhold buyers' allocations past this point. {enableClaim} can only open EARLIER.
+    uint256 public immutable CLAIM_START;
 
     /*//////////////////////////////////////////////////////////////
                                  STATE
@@ -217,6 +225,16 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     error NothingToSweep();
     error PresaleNotEnded();
     error EthTransferFailed();
+    error NotFullyFunded();
+    error RenounceDisabled();
+    error PriceExceedsMax();
+    error InvalidTokenDecimals();
+    error FeeOnTransferNotSupported();
+    error NotFunded();
+    error PhaseCannotGoBackward();
+    error TimerCannotShorten();
+    error InvalidSchedule();
+    error SaleClosed();
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -230,9 +248,17 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @param usdt USDT payment token (6 decimals).
     /// @param ethUsdFeed Chainlink ETH/USD aggregator.
     /// @param treasury Treasury and initial owner/admin (receives funds and unsold $CON).
-    constructor(IERC20 conToken, IERC20 usdc, IERC20 usdt, IAggregatorV3 ethUsdFeed, address treasury)
-        Ownable(treasury)
-    {
+    /// @param saleHardEnd Unix timestamp at/after which buying is permanently closed.
+    /// @param claimStart Unix timestamp at/after which claiming auto-opens (must be > `saleHardEnd`).
+    constructor(
+        IERC20 conToken,
+        IERC20 usdc,
+        IERC20 usdt,
+        IAggregatorV3 ethUsdFeed,
+        address treasury,
+        uint256 saleHardEnd,
+        uint256 claimStart
+    ) Ownable(treasury) {
         if (
             address(conToken) == address(0) || address(usdc) == address(0) || address(usdt) == address(0)
                 || address(ethUsdFeed) == address(0) || treasury == address(0)
@@ -242,12 +268,26 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         if (ethUsdFeed.decimals() != FEED_DECIMALS) {
             revert InvalidFeedDecimals();
         }
+        // Enforce the decimal assumptions the pricing math relies on (stables 6, CON 18).
+        if (
+            IERC20Metadata(address(usdc)).decimals() != 6 || IERC20Metadata(address(usdt)).decimals() != 6
+                || IERC20Metadata(address(conToken)).decimals() != 18
+        ) {
+            revert InvalidTokenDecimals();
+        }
+        // Fixed schedule: the sale must end in the future and claiming must open strictly after it.
+        // forge-lint: disable-next-line(block-timestamp) - schedule is defined relative to deploy time.
+        if (saleHardEnd <= block.timestamp || claimStart <= saleHardEnd) {
+            revert InvalidSchedule();
+        }
 
         CON_TOKEN = conToken;
         USDC = usdc;
         USDT = usdt;
         ETH_USD_FEED = ethUsdFeed;
         TREASURY = treasury;
+        SALE_HARD_END = saleHardEnd;
+        CLAIM_START = claimStart;
 
         // Fixed phase prices: $0.005, $0.006, $0.007, $0.008, $0.009 (1e6 USD scale).
         uint256[NUM_PHASES] memory prices = [uint256(5000), 6000, 7000, 8000, 9000];
@@ -268,6 +308,40 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @param stable The payment token; must equal {USDC} or {USDT}.
     /// @param amount The stablecoin amount to spend (6 decimals).
     function buyWithStable(IERC20 stable, uint256 amount) external nonReentrant whenNotPaused {
+        _buyWithStable(stable, amount, 0);
+    }
+
+    /// @notice Buy (book) $CON with a stablecoin, reverting if the active phase price exceeds a bound.
+    /// @dev Identical to {buyWithStable(IERC20,uint256)} but with execution-price protection.
+    /// @param stable The payment token; must equal {USDC} or {USDT}.
+    /// @param amount The stablecoin amount to spend (6 decimals).
+    /// @param maxPriceUsdE6 Max acceptable phase price in USD(1e6); `0` means no limit.
+    function buyWithStable(IERC20 stable, uint256 amount, uint256 maxPriceUsdE6) external nonReentrant whenNotPaused {
+        _buyWithStable(stable, amount, maxPriceUsdE6);
+    }
+
+    /// @notice Buy (book) $CON with ETH, priced via the Chainlink ETH/USD feed.
+    /// @dev Books the allocation; no $CON is transferred until {claim}. The CON amount is clamped to
+    ///      the remaining cap, only the exact ETH cost is kept, and any excess ETH is refunded after
+    ///      state updates (CEI) under the reentrancy guard.
+    function buyWithETH() external payable nonReentrant whenNotPaused {
+        _buyWithETH(0);
+    }
+
+    /// @notice Buy (book) $CON with ETH, reverting if the active phase price exceeds a bound.
+    /// @dev Identical to {buyWithETH()} but with execution-price protection.
+    /// @param maxPriceUsdE6 Max acceptable phase price in USD(1e6); `0` means no limit.
+    function buyWithETH(uint256 maxPriceUsdE6) external payable nonReentrant whenNotPaused {
+        _buyWithETH(maxPriceUsdE6);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                              BUY (INTERNAL)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Core stablecoin buy logic. `maxPriceUsdE6 == 0` disables the price check. Rejects tokens
+    ///      that take a fee on transfer so booked allocations are always fully backed.
+    function _buyWithStable(IERC20 stable, uint256 amount, uint256 maxPriceUsdE6) internal {
         if (stable != USDC && stable != USDT) revert UnsupportedStable();
         if (amount == 0) revert ZeroPayment();
 
@@ -275,6 +349,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         Phase storage phase = _activePhase(phaseIndex);
 
         uint256 price = phase.priceUsdE6;
+        if (maxPriceUsdE6 != 0 && price > maxPriceUsdE6) revert PriceExceedsMax();
         uint256 conAmount = (amount * CON_SCALE) / price;
 
         uint256 remaining = _baseRemaining(phase);
@@ -293,20 +368,23 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         // Stables are 1:1 USD with 6 decimals, so the charged amount IS the USD(1e6) contributed.
         _awardBonus(msg.sender, charge);
 
+        // Reject fee-on-transfer stables: the contract must actually receive the full `charge` that
+        // was booked, otherwise later claims could be under-backed.
+        uint256 balBefore = stable.balanceOf(address(this));
         stable.safeTransferFrom(msg.sender, address(this), charge);
+        if (stable.balanceOf(address(this)) - balBefore < charge) revert FeeOnTransferNotSupported();
     }
 
-    /// @notice Buy (book) $CON with ETH, priced via the Chainlink ETH/USD feed.
-    /// @dev Books the allocation; no $CON is transferred until {claim}. The CON amount is clamped to
-    ///      the remaining cap, only the exact ETH cost is kept, and any excess ETH is refunded after
-    ///      state updates (CEI) under the reentrancy guard.
-    function buyWithETH() external payable nonReentrant whenNotPaused {
+    /// @dev Core ETH buy logic. `maxPriceUsdE6 == 0` disables the price check. Clamps to the remaining
+    ///      cap, keeps only the exact ETH cost and refunds the remainder after state updates (CEI).
+    function _buyWithETH(uint256 maxPriceUsdE6) internal {
         if (msg.value == 0) revert ZeroPayment();
 
         uint8 phaseIndex = currentPhase;
         Phase storage phase = _activePhase(phaseIndex);
 
         uint256 price = phase.priceUsdE6;
+        if (maxPriceUsdE6 != 0 && price > maxPriceUsdE6) revert PriceExceedsMax();
         uint256 ethUsd = _readEthUsd();
 
         // USD(1e6) value of msg.value, then CON(1e18) at the phase price.
@@ -349,8 +427,12 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
 
     /// @notice Claim the caller's booked $CON allocation once claiming is open.
     /// @dev Pull-pattern, CEI, reentrancy-guarded and double-claim safe (allocation zeroed first).
+    ///      Claiming is available once the owner has called {enableClaim} OR the scheduled
+    ///      {CLAIM_START} has arrived, so buyers can always claim at/after {CLAIM_START} even if the
+    ///      owner never opens it early.
     function claim() external nonReentrant {
-        if (!claimOpen) revert ClaimNotOpen();
+        // forge-lint: disable-next-line(block-timestamp) - scheduled auto-open is intentional.
+        if (!claimOpen && block.timestamp < CLAIM_START) revert ClaimNotOpen();
 
         uint256 amount = purchased[msg.sender];
         if (amount == 0) revert NothingToClaim();
@@ -368,13 +450,19 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Start (or restart) a phase, activating it and setting its timer.
-    /// @dev The owner may activate ANY valid phase index (0..{NUM_PHASES}-1) in any order, allowing
-    ///      free switching (forward or backward). Cannot be called once the presale has ended.
-    /// @param i Phase index to start (any valid index `0..NUM_PHASES-1`).
+    /// @dev Phases are forward-only: the owner may (re)start the current phase or move to a later,
+    ///      more expensive one, but can never activate an earlier/cheaper phase. Requires the sale to
+    ///      be pre-funded with the full {PRESALE_CAP} of $CON so every future booking is provably
+    ///      backed. Cannot be called once the presale has ended.
+    /// @param i Phase index to start; must satisfy `currentPhase <= i < NUM_PHASES`.
     /// @param duration Seconds from now until the phase closes.
     function startPhase(uint8 i, uint64 duration) external onlyOwner {
+        // Root protection: the presale must already hold the full cap of CON before any phase opens,
+        // so every allocation booked from now on (base + bonuses) is fully claimable.
+        if (CON_TOKEN.balanceOf(address(this)) < PRESALE_CAP) revert NotFunded();
         if (presaleEnded) revert PresaleIsEnded();
         if (i >= NUM_PHASES) revert InvalidPhaseIndex();
+        if (i < currentPhase) revert PhaseCannotGoBackward();
         if (duration == 0) revert ZeroDuration();
 
         // forge-lint: disable-next-line(unsafe-typecast) - block.timestamp fits in uint64 for millennia.
@@ -387,10 +475,13 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     }
 
     /// @notice Set the active phase's end timestamp directly.
-    /// @param newEndsAt New end timestamp for the active phase.
+    /// @dev The timer can only ever be lengthened ({TimerCannotShorten}); the owner can never pull a
+    ///      phase's end forward via this function. Use {endPhase} to close a phase early instead.
+    /// @param newEndsAt New end timestamp for the active phase; must be >= the current end.
     function setTimer(uint64 newEndsAt) external onlyOwner {
         Phase storage phase = phases[currentPhase];
         if (!phase.started) revert PhaseNotStarted();
+        if (newEndsAt < phase.endsAt) revert TimerCannotShorten();
         phase.endsAt = newEndsAt;
         emit TimerSet(currentPhase, newEndsAt);
     }
@@ -424,9 +515,15 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         emit PresaleEnded();
     }
 
-    /// @notice Permanently enable claiming. One-way and independent of {endPresale}.
+    /// @notice Permanently enable claiming EARLIER than the scheduled {CLAIM_START}. One-way and
+    ///         independent of {endPresale}.
+    /// @dev Reverts ({NotFullyFunded}) unless the contract holds at least the outstanding allocation,
+    ///      so claiming can never be opened while under-funded. This only ever moves claiming earlier;
+    ///      it can never delay it, because {CLAIM_START} auto-opens claiming regardless of this flag.
     function enableClaim() external onlyOwner {
         if (claimOpen) revert ClaimAlreadyOpen();
+        uint256 outstanding = totalSold - totalClaimed;
+        if (CON_TOKEN.balanceOf(address(this)) < outstanding) revert NotFullyFunded();
         claimOpen = true;
         emit ClaimEnabled();
     }
@@ -441,11 +538,18 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
         _unpause();
     }
 
+    /// @notice Renouncing ownership is permanently disabled to avoid stranding buyer allocations.
+    /// @dev Always reverts ({RenounceDisabled}). Two-step ownership transfer via {Ownable2Step}
+    ///      remains available.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
+    }
+
     /// @notice Withdraw raised funds to the treasury.
     /// @dev `asset == address(0)` withdraws ETH; otherwise withdraws the full balance of `asset`.
     ///      Reverts if `asset` is the $CON token (buyers' tokens are never withdrawable this way).
     /// @param asset The asset to withdraw (address(0) for ETH).
-    function withdraw(address asset) external onlyOwner nonReentrant {
+    function withdraw(address asset) external nonReentrant onlyOwner {
         if (asset == address(CON_TOKEN)) revert CannotWithdrawConToken();
 
         if (asset == address(0)) {
@@ -466,7 +570,7 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @dev Excess = `balanceOf(this) - (totalSold - totalClaimed)`. Only callable once the presale has
     ///      ended (so buying can no longer create new claims after a sweep). Reverts if there is nothing
     ///      to sweep, guaranteeing outstanding claims remain fully backed.
-    function sweepUnsold() external onlyOwner nonReentrant {
+    function sweepUnsold() external nonReentrant onlyOwner {
         if (!presaleEnded) revert PresaleNotEnded();
         uint256 outstanding = totalSold - totalClaimed;
         uint256 balance = CON_TOKEN.balanceOf(address(this));
@@ -504,9 +608,9 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @return active True if a buy would be accepted right now.
     function isBuyingActive() external view returns (bool active) {
         Phase storage phase = phases[currentPhase];
-        // forge-lint: disable-next-line(block-timestamp) - timed phase window is intentional.
-        return phase.started && !presaleEnded && !paused() && block.timestamp <= phase.endsAt && phase.sold < phase.cap
-            && totalSold < PRESALE_CAP;
+        // forge-lint: disable-next-line(block-timestamp) - timed phase window + hard end are intentional.
+        return phase.started && !presaleEnded && !paused() && block.timestamp < SALE_HARD_END
+            && block.timestamp <= phase.endsAt && phase.sold < phase.cap && totalSold < PRESALE_CAP;
     }
 
     /// @notice Preview the base + stacking-bonus CON a buyer would receive for spending `usdE6`.
@@ -568,6 +672,8 @@ contract Presale is Ownable2Step, Pausable, ReentrancyGuard {
     /// @dev Returns the active phase storage pointer after enforcing that buying is allowed.
     function _activePhase(uint8 phaseIndex) internal view returns (Phase storage phase) {
         if (presaleEnded) revert PresaleIsEnded();
+        // forge-lint: disable-next-line(block-timestamp) - hard sale end is intentional.
+        if (block.timestamp >= SALE_HARD_END) revert SaleClosed();
         phase = phases[phaseIndex];
         if (!phase.started) revert PhaseNotStarted();
         // forge-lint: disable-next-line(block-timestamp) - timed phase window is intentional.

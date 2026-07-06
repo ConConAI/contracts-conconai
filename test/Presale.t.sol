@@ -6,6 +6,7 @@ import {Presale} from "../src/Presale.sol";
 import {IAggregatorV3} from "../src/interfaces/IAggregatorV3.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAggregator} from "./mocks/MockAggregator.sol";
+import {MockFeeOnTransferERC20} from "./mocks/MockFeeOnTransferERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
@@ -30,13 +31,18 @@ contract PresaleTest is Test {
     int256 internal constant ETH_PRICE = 2000e8; // $2000 / ETH, 8 decimals
     uint64 internal constant LONG = 365 days;
 
+    // Fixed schedule for tests: hard sale end far in the future (well past any LONG-based warp used
+    // here) and claim auto-open 3 days after that. Default test `block.timestamp` is 1.
+    uint256 internal constant HARD_END = 2_000_000_000; // ~2033
+    uint256 internal constant CLAIM_TS = HARD_END + 3 days;
+
     function setUp() public {
         con = new MockERC20("ConCon", "CON", 18);
         usdc = new MockERC20("USD Coin", "USDC", 6);
         usdt = new MockERC20("Tether USD", "USDT", 6);
         feed = new MockAggregator(8, ETH_PRICE);
 
-        presale = new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin);
+        presale = _deployPresale();
 
         // Fund the presale so claims can be paid out (treasury action in production).
         con.mint(address(presale), FUND);
@@ -45,6 +51,12 @@ contract PresaleTest is Test {
     /*//////////////////////////////////////////////////////////////
                                 HELPERS
     //////////////////////////////////////////////////////////////*/
+
+    function _deployPresale() internal returns (Presale) {
+        return new Presale(
+            IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin, HARD_END, CLAIM_TS
+        );
+    }
 
     function _startPhase(uint8 i, uint64 duration) internal {
         vm.prank(admin);
@@ -88,29 +100,39 @@ contract PresaleTest is Test {
 
     function test_ConstructorRevertsOnZeroAddress() public {
         vm.expectRevert(Presale.ZeroAddress.selector);
-        new Presale(IERC20(address(0)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin);
+        new Presale(IERC20(address(0)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin, HARD_END, CLAIM_TS);
 
         vm.expectRevert(Presale.ZeroAddress.selector);
-        new Presale(IERC20(address(con)), IERC20(address(0)), IERC20(address(usdt)), feed, admin);
+        new Presale(IERC20(address(con)), IERC20(address(0)), IERC20(address(usdt)), feed, admin, HARD_END, CLAIM_TS);
 
         vm.expectRevert(Presale.ZeroAddress.selector);
-        new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(0)), feed, admin);
+        new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(0)), feed, admin, HARD_END, CLAIM_TS);
 
         vm.expectRevert(Presale.ZeroAddress.selector);
         new Presale(
-            IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), IAggregatorV3(address(0)), admin
+            IERC20(address(con)),
+            IERC20(address(usdc)),
+            IERC20(address(usdt)),
+            IAggregatorV3(address(0)),
+            admin,
+            HARD_END,
+            CLAIM_TS
         );
 
         // A zero treasury is rejected by Ownable's own guard (it is the initial owner), which runs
         // before the body. Still a zero-address revert, just a different selector.
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, address(0));
+        new Presale(
+            IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, address(0), HARD_END, CLAIM_TS
+        );
     }
 
     function test_ConstructorRevertsOnWrongFeedDecimals() public {
         MockAggregator badFeed = new MockAggregator(18, ETH_PRICE);
         vm.expectRevert(Presale.InvalidFeedDecimals.selector);
-        new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), badFeed, admin);
+        new Presale(
+            IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), badFeed, admin, HARD_END, CLAIM_TS
+        );
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -481,17 +503,9 @@ contract PresaleTest is Test {
     }
 
     function test_SweepRevertsWhenNothingToSweep() public {
-        // Deploy a fresh presale funded with exactly the outstanding amount (none excess).
-        Presale p = new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin);
-        vm.prank(admin);
-        p.startPhase(0, LONG);
-        usdc.mint(alice, 5_000_000);
-        vm.startPrank(alice);
-        usdc.approve(address(p), 5_000_000);
-        p.buyWithStable(IERC20(address(usdc)), 5_000_000);
-        vm.stopPrank();
-        con.mint(address(p), p.totalSold()); // fund exactly outstanding
-
+        // A fresh, never-funded presale that ends with nothing booked has no excess to sweep
+        // (balance 0, outstanding 0). Pre-funding is only required to START a phase, not to end.
+        Presale p = _deployPresale();
         vm.startPrank(admin);
         p.endPresale();
         vm.expectRevert(Presale.NothingToSweep.selector);
@@ -538,8 +552,8 @@ contract PresaleTest is Test {
                           ADMIN / PHASE CONTROL
     //////////////////////////////////////////////////////////////*/
 
-    function test_StartPhaseAllowsFreeSwitching() public {
-        // Owner can jump straight to any phase (0 -> 2), no sequential restriction.
+    function test_StartPhaseAllowsForwardJumps() public {
+        // Owner can jump straight forward to any later phase (0 -> 2).
         _startPhase(2, LONG);
         assertEq(presale.currentPhase(), 2);
 
@@ -551,13 +565,9 @@ contract PresaleTest is Test {
         _startPhase(4, LONG);
         assertEq(presale.currentPhase(), 4);
 
-        // Can go backwards (4 -> 1).
-        _startPhase(1, LONG);
-        assertEq(presale.currentPhase(), 1);
-
         // Restarting the active phase is allowed too.
-        _startPhase(1, LONG);
-        assertEq(presale.currentPhase(), 1);
+        _startPhase(4, LONG);
+        assertEq(presale.currentPhase(), 4);
     }
 
     function test_StartPhaseRevertsOnInvalidIndex() public {
@@ -969,5 +979,256 @@ contract PresaleTest is Test {
         assertGe(con.balanceOf(address(presale)), presale.totalSold() - presale.totalClaimed());
         // Contract never keeps more ETH than the exact cost of what was booked.
         assertLe(address(presale).balance, value);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                     AUDIT REMEDIATIONS (SolidProof)
+    //////////////////////////////////////////////////////////////*/
+
+    // MEDIUM #1 (root fix) - startPhase requires the sale to be pre-funded with the full cap.
+    function test_StartPhaseRevertsWhenNotFunded() public {
+        Presale p = _deployPresale(); // fresh, unfunded
+
+        // Under-funded: even one wei short of PRESALE_CAP blocks starting.
+        con.mint(address(p), FUND - 1);
+        vm.prank(admin);
+        vm.expectRevert(Presale.NotFunded.selector);
+        p.startPhase(0, LONG);
+
+        // Funded with exactly the full cap: starting succeeds.
+        con.mint(address(p), 1);
+        vm.prank(admin);
+        p.startPhase(0, LONG);
+        assertEq(p.currentPhase(), 0);
+    }
+
+    function test_EnableClaimSucceedsWhenFunded() public {
+        // The default presale is funded with 50M in setUp.
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 5_000_000);
+        vm.prank(admin);
+        presale.enableClaim();
+        assertTrue(presale.claimOpen());
+    }
+
+    // LOW #2 - renounceOwnership disabled; two-step transfer still works.
+    function test_RenounceOwnershipReverts() public {
+        vm.prank(admin);
+        vm.expectRevert(Presale.RenounceDisabled.selector);
+        presale.renounceOwnership();
+        assertEq(presale.owner(), admin);
+    }
+
+    function test_TransferOwnershipStillWorksAfterRenounceDisabled() public {
+        vm.prank(admin);
+        presale.transferOwnership(bob);
+        vm.prank(bob);
+        presale.acceptOwnership();
+        assertEq(presale.owner(), bob);
+    }
+
+    // LOW #1 - execution-price protection on both buy paths.
+    function test_BuyWithStableRevertsWhenPriceExceedsMax() public {
+        _startPhase(0, LONG); // price 5000
+        usdc.mint(alice, 5_000_000);
+        vm.startPrank(alice);
+        usdc.approve(address(presale), 5_000_000);
+        vm.expectRevert(Presale.PriceExceedsMax.selector);
+        presale.buyWithStable(IERC20(address(usdc)), 5_000_000, 4999);
+        vm.stopPrank();
+    }
+
+    function test_BuyWithStableMaxPriceEqualOrZeroBehavesSame() public {
+        _startPhase(0, LONG);
+
+        // maxPrice == exact price: allowed, books the same as the 2-arg call.
+        usdc.mint(alice, 5_000_000);
+        vm.startPrank(alice);
+        usdc.approve(address(presale), 5_000_000);
+        presale.buyWithStable(IERC20(address(usdc)), 5_000_000, 5000);
+        vm.stopPrank();
+        assertEq(presale.purchased(alice), 1000 * 1e18);
+
+        // maxPrice == 0 (no limit): identical booking.
+        usdc.mint(bob, 5_000_000);
+        vm.startPrank(bob);
+        usdc.approve(address(presale), 5_000_000);
+        presale.buyWithStable(IERC20(address(usdc)), 5_000_000, 0);
+        vm.stopPrank();
+        assertEq(presale.purchased(bob), 1000 * 1e18);
+    }
+
+    function test_BuyWithETHRevertsWhenPriceExceedsMax() public {
+        _startPhase(0, LONG);
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        vm.expectRevert(Presale.PriceExceedsMax.selector);
+        presale.buyWithETH{value: 1 ether}(4999);
+    }
+
+    function test_BuyWithETHMaxPriceHighBehavesSame() public {
+        _startPhase(0, LONG);
+        vm.deal(alice, 1 ether);
+        vm.prank(alice);
+        presale.buyWithETH{value: 1 ether}(10_000); // above price 5000 -> allowed
+        assertEq(presale.purchased(alice), 400_000 * 1e18); // same as the no-arg buy
+    }
+
+    // LOW #3 - decimal enforcement + fee-on-transfer rejection.
+    function test_ConstructorRevertsOnInvalidTokenDecimals() public {
+        MockERC20 badStable = new MockERC20("Bad", "BAD", 8); // stables must be 6 decimals
+        vm.expectRevert(Presale.InvalidTokenDecimals.selector);
+        new Presale(
+            IERC20(address(con)), IERC20(address(badStable)), IERC20(address(usdt)), feed, admin, HARD_END, CLAIM_TS
+        );
+    }
+
+    function test_FeeOnTransferStableReverts() public {
+        // Presale whose "USDC" is a fee-on-transfer token (still 6 decimals so the ctor passes).
+        MockFeeOnTransferERC20 feeStable = new MockFeeOnTransferERC20();
+        Presale p = new Presale(
+            IERC20(address(con)), IERC20(address(feeStable)), IERC20(address(usdt)), feed, admin, HARD_END, CLAIM_TS
+        );
+        con.mint(address(p), FUND); // pre-fund so the phase can start
+        vm.prank(admin);
+        p.startPhase(0, LONG);
+
+        feeStable.mint(alice, 5_000_000);
+        vm.startPrank(alice);
+        feeStable.approve(address(p), 5_000_000);
+        vm.expectRevert(Presale.FeeOnTransferNotSupported.selector);
+        p.buyWithStable(IERC20(address(feeStable)), 5_000_000);
+        vm.stopPrank();
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                   OWNER RESTRICTIONS + FIXED SCHEDULE
+    //////////////////////////////////////////////////////////////*/
+
+    // #6 - phases are forward-only.
+    function test_StartPhaseCannotGoBackward() public {
+        _startPhase(2, LONG);
+        assertEq(presale.currentPhase(), 2);
+
+        // Moving to an earlier/cheaper phase is rejected.
+        vm.prank(admin);
+        vm.expectRevert(Presale.PhaseCannotGoBackward.selector);
+        presale.startPhase(1, LONG);
+
+        // Restarting the current phase and moving forward are both allowed.
+        _startPhase(2, LONG);
+        _startPhase(4, LONG);
+        assertEq(presale.currentPhase(), 4);
+    }
+
+    // #7 - the phase timer can only be lengthened via setTimer.
+    function test_SetTimerCannotShorten() public {
+        _startPhase(0, 1000);
+        uint64 endsAt = _phaseEndsAt(0);
+
+        vm.prank(admin);
+        vm.expectRevert(Presale.TimerCannotShorten.selector);
+        presale.setTimer(endsAt - 1);
+
+        // Equal or later is fine.
+        vm.prank(admin);
+        presale.setTimer(endsAt);
+        vm.prank(admin);
+        presale.setTimer(endsAt + 500);
+        assertEq(_phaseEndsAt(0), endsAt + 500);
+
+        // extendTimer still works and is unaffected.
+        vm.prank(admin);
+        presale.extendTimer(100);
+        assertEq(_phaseEndsAt(0), endsAt + 600);
+    }
+
+    // #8 - no buying at/after the hard sale end.
+    function test_BuyRevertsAtHardSaleEnd() public {
+        _startPhase(0, LONG); // endsAt is far before HARD_END here
+
+        usdc.mint(alice, 5_000_000);
+        vm.startPrank(alice);
+        usdc.approve(address(presale), 5_000_000);
+        vm.warp(HARD_END); // reach the hard end
+        vm.expectRevert(Presale.SaleClosed.selector);
+        presale.buyWithStable(IERC20(address(usdc)), 5_000_000);
+        vm.stopPrank();
+
+        vm.deal(bob, 1 ether);
+        vm.prank(bob);
+        vm.expectRevert(Presale.SaleClosed.selector);
+        presale.buyWithETH{value: 1 ether}();
+
+        // The view also reports buying inactive.
+        assertFalse(presale.isBuyingActive());
+    }
+
+    // #8 - claiming auto-opens at CLAIM_START even if enableClaim was never called.
+    function test_ClaimAutoOpensAtClaimStart() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 5_000_000); // books 1000 CON
+        uint256 amount = presale.purchased(alice);
+
+        // Before claimStart and without enableClaim: claiming is closed.
+        vm.prank(alice);
+        vm.expectRevert(Presale.ClaimNotOpen.selector);
+        presale.claim();
+
+        // At claimStart it opens automatically, no admin action required.
+        vm.warp(CLAIM_TS);
+        assertFalse(presale.claimOpen());
+        vm.prank(alice);
+        presale.claim();
+        assertEq(con.balanceOf(alice), amount);
+        assertEq(presale.claimed(alice), amount);
+    }
+
+    // #8 - the owner can still open claiming EARLY, before claimStart.
+    function test_ClaimWorksAfterEnableClaimBeforeClaimStart() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 5_000_000);
+        uint256 amount = presale.purchased(alice);
+
+        vm.prank(admin);
+        presale.enableClaim();
+
+        // Still well before CLAIM_TS, but enableClaim opened it.
+        assertLt(block.timestamp, CLAIM_TS);
+        vm.prank(alice);
+        presale.claim();
+        assertEq(con.balanceOf(alice), amount);
+    }
+
+    // #8 - constructor rejects a schedule that is not strictly increasing / in the future.
+    function test_ConstructorRevertsOnInvalidSchedule() public {
+        // saleHardEnd in the past/now.
+        vm.expectRevert(Presale.InvalidSchedule.selector);
+        new Presale(
+            IERC20(address(con)),
+            IERC20(address(usdc)),
+            IERC20(address(usdt)),
+            feed,
+            admin,
+            block.timestamp,
+            block.timestamp + 1 days
+        );
+
+        // claimStart not strictly after saleHardEnd.
+        vm.expectRevert(Presale.InvalidSchedule.selector);
+        new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin, HARD_END, HARD_END);
+    }
+
+    // Withdrawals are never time-locked: the team can pull raised funds at any time.
+    function test_WithdrawWorksAtAnyTime() public {
+        _startPhase(0, LONG);
+        _buyStable(alice, usdc, 5_000_000); // raises 5 USDC
+
+        // Immediately (well before any sale/claim milestone) the admin can withdraw.
+        uint256 before = usdc.balanceOf(admin);
+        vm.prank(admin);
+        presale.withdraw(address(usdc));
+        assertEq(usdc.balanceOf(admin), before + 5_000_000);
+        assertEq(usdc.balanceOf(address(presale)), 0);
     }
 }

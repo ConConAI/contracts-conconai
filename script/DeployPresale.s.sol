@@ -21,6 +21,12 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 contract DeployPresale is Script {
     error AddressNotConfigured(string field);
 
+    /// @notice Hard sale end: 2026-11-09 12:00 UTC. No buying is possible at/after this time.
+    uint256 internal constant SALE_HARD_END = 1_794_225_600;
+
+    /// @notice Claim auto-open: 2026-11-12 12:00 UTC. Claiming becomes available regardless of admin.
+    uint256 internal constant CLAIM_START = 1_794_484_800;
+
     /// @notice Reads config from `deployments/addresses.json` and broadcasts the presale deploy.
     /// @return presale The deployed {Presale} instance.
     function run() external returns (Presale presale) {
@@ -42,7 +48,9 @@ contract DeployPresale is Script {
         console2.log("  treasury/admin:", admin);
 
         vm.startBroadcast();
-        presale = new Presale(IERC20(token), IERC20(usdc), IERC20(usdt), IAggregatorV3(ethUsdFeed), admin);
+        presale = new Presale(
+            IERC20(token), IERC20(usdc), IERC20(usdt), IAggregatorV3(ethUsdFeed), admin, SALE_HARD_END, CLAIM_START
+        );
         vm.stopBroadcast();
 
         console2.log("  presale deployed at:", address(presale));

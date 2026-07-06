@@ -29,6 +29,11 @@ contract DeploySepoliaTestEnv is Script {
     /// @notice Seed ETH/USD price for the mock oracle: $3000 with 8 decimals.
     int256 internal constant SEED_ETH_USD = 3000e8;
 
+    /// @notice Test schedule: hard sale end 30 days out, claim auto-open 33 days out (relative to
+    ///         deploy time so the test environment stays usable whenever it is redeployed).
+    uint256 internal constant SALE_DURATION = 30 days;
+    uint256 internal constant CLAIM_OFFSET = 33 days;
+
     /// @notice Sepolia chain id.
     uint256 internal constant SEPOLIA_CHAIN_ID = 11_155_111;
 
@@ -67,7 +72,15 @@ contract DeploySepoliaTestEnv is Script {
         feed = new MockAggregatorV3(SEED_ETH_USD);
 
         // Presale bound to the test token + mocks; owner/treasury is the admin.
-        presale = new Presale(IERC20(address(token)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin);
+        presale = new Presale(
+            IERC20(address(token)),
+            IERC20(address(usdc)),
+            IERC20(address(usdt)),
+            feed,
+            admin,
+            block.timestamp + SALE_DURATION,
+            block.timestamp + CLAIM_OFFSET
+        );
 
         // Fund the presale so claims can be paid (requires the broadcaster to be the admin/treasury).
         // forge-lint: disable-next-line(erc20-unchecked-transfer) - ConToken returns true or reverts.

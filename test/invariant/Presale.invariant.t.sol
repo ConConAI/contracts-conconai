@@ -32,7 +32,15 @@ contract PresaleInvariantTest is Test {
         usdt = new MockERC20("Tether USD", "USDT", 6);
         feed = new MockAggregator(8, 2000e8);
 
-        presale = new Presale(IERC20(address(con)), IERC20(address(usdc)), IERC20(address(usdt)), feed, admin);
+        presale = new Presale(
+            IERC20(address(con)),
+            IERC20(address(usdc)),
+            IERC20(address(usdt)),
+            feed,
+            admin,
+            block.timestamp + 3651 days,
+            block.timestamp + 3654 days
+        );
         con.mint(address(presale), FUND);
 
         vm.startPrank(admin);
